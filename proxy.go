@@ -53,6 +53,7 @@ type Config struct {
 	ClearAllProxy       bool          // clear all proxies on init
 	MaxUsed             int           // max usage count before rotation
 	IsBlockAssets       bool          // route static assets directly
+	Limit               int           // duplicate each rotating proxyString into N independent slots (0/1 = no expansion). Ignored for static/sticky.
 }
 
 // ProxyHandle is returned by Acquire(). Caller MUST call Release() when done.

@@ -113,6 +113,16 @@ func (im *InstanceManager) StartInstance(proxyID int64, upstreamProxyStr string)
 	return addr, nil
 }
 
+// Has reports whether an instance is currently registered for proxyID.
+// Note: registered != listening — use only as a fast pre-check; a stale
+// entry may still exist for an instance whose Serve goroutine died.
+func (im *InstanceManager) Has(proxyID int64) bool {
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+	_, ok := im.instances[proxyID]
+	return ok
+}
+
 // StopInstance stops and removes the instance for proxyID.
 func (im *InstanceManager) StopInstance(proxyID int64) {
 	im.mu.Lock()

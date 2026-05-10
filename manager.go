@@ -92,6 +92,9 @@ func (pm *ProxyManager) Acquire(ctx context.Context, threadID int) (*ProxyHandle
 		if p.Type == ProxyTypeSticky {
 			proxyStr = processStickyProxyStr(proxyStr)
 		}
+		if err := pm.ensureInstanceAlive(p.ID, proxyStr); err != nil {
+			return nil, err
+		}
 		return &ProxyHandle{
 			ID:       p.ID,
 			Type:     p.Type,
@@ -108,6 +111,11 @@ func (pm *ProxyManager) Acquire(ctx context.Context, threadID int) (*ProxyHandle
 		return nil, err
 	}
 
+	if err := pm.ensureInstanceAlive(p.ID, proxyStr); err != nil {
+		pm.releaseProxy(p.ID)
+		return nil, err
+	}
+
 	return &ProxyHandle{
 		ID:       p.ID,
 		Type:     p.Type,
@@ -115,6 +123,35 @@ func (pm *ProxyManager) Acquire(ctx context.Context, threadID int) (*ProxyHandle
 		Upstream: proxyStr,
 		manager:  pm,
 	}, nil
+}
+
+// ensureInstanceAlive guarantees a local listener exists for proxyID when
+// isBlockAssets is on. Without this, Acquire could return Addr=127.0.0.1:port
+// for a port nobody is listening on (e.g. cooldown path returned a stale
+// proxy_str and rotation never restarted the instance), causing the caller
+// to see a misleading "connection refused" instead of the real upstream
+// error. No-op when isBlockAssets is off.
+func (pm *ProxyManager) ensureInstanceAlive(proxyID int64, proxyStr string) error {
+	if !pm.isBlockAssets || pm.instances == nil {
+		return nil
+	}
+	if pm.instances.Has(proxyID) {
+		return nil
+	}
+	if proxyStr == "" {
+		// Read DB error column to surface the most informative diagnostic.
+		pm.mu.RLock()
+		errMsg := ""
+		if cached, ok := pm.cache[proxyID]; ok {
+			errMsg = cached.Error
+		}
+		pm.mu.RUnlock()
+		if errMsg != "" {
+			return fmt.Errorf("local instance for proxy %d not running and no proxy_str (last error: %s)", proxyID, errMsg)
+		}
+		return fmt.Errorf("local instance for proxy %d not running and no proxy_str", proxyID)
+	}
+	return pm.restartDumbProxyInstance(proxyID, proxyStr)
 }
 
 // Reconfigure updates config at runtime: reloads proxy strings and restarts instances.

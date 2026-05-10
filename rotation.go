@@ -194,7 +194,14 @@ func (pm *ProxyManager) rotateProxy(ctx context.Context, p *Proxy) (string, erro
 		return pm.rotateIPv4Xoay(ctx, p, now)
 	}
 
-	// Default: not eligible for rotation — just increment used (except Auto)
+	// Default: not eligible for rotation — just increment used (except Auto).
+	// If proxy_str is empty AND a previous rotation left an error in DB,
+	// surface that error: returning "" + nil here would cascade into a
+	// downstream "connection refused" because there's no upstream to forward
+	// to. The stale error is the most informative diagnostic available.
+	if p.ProxyStr == "" && p.Error != "" {
+		return "", fmt.Errorf("no proxy_str available, last rotation error: %s", p.Error)
+	}
 	if p.Type != ProxyTypeAuto {
 		pm.incrementUsed(p.ID, now)
 	}

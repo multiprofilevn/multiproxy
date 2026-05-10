@@ -50,7 +50,11 @@ func (pm *ProxyManager) rotateViaProvider(ctx context.Context, p *Proxy, now tim
 
 	newProxyStr := result.ProxyStr
 	pm.updateAfterRotation(p.ID, newProxyStr, now)
-	pm.restartDumbProxyInstance(p.ID, newProxyStr)
+	if err := pm.restartDumbProxyInstance(p.ID, newProxyStr); err != nil {
+		// Rotation succeeded upstream but local listener died — surface as
+		// error so caller doesn't get a connection-refused later.
+		return "", err
+	}
 	pm.sleepChangeWait()
 	return newProxyStr, nil
 }
@@ -115,7 +119,9 @@ func (pm *ProxyManager) rotateIPv4Xoay(ctx context.Context, p *Proxy, now time.T
 
 	newProxyStr := result.ProxyStr
 	pm.updateAfterRotation(p.ID, newProxyStr, now)
-	pm.restartDumbProxyInstance(p.ID, newProxyStr)
+	if err := pm.restartDumbProxyInstance(p.ID, newProxyStr); err != nil {
+		return "", err
+	}
 	pm.sleepChangeWait()
 	return newProxyStr, nil
 }

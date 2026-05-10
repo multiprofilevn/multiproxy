@@ -173,12 +173,18 @@ func (pm *ProxyManager) getConnectionString(proxyID int64, proxyStr string) stri
 }
 
 // restartDumbProxyInstance restarts the local dumbproxy instance with a new upstream.
-// No-op when isBlockAssets is false.
-func (pm *ProxyManager) restartDumbProxyInstance(proxyID int64, newProxyStr string) {
+// No-op when isBlockAssets is false. Returns the StartInstance error so callers
+// can decide whether to surface it; previously this was silently swallowed which
+// made dead-listener bugs invisible to the calling app.
+func (pm *ProxyManager) restartDumbProxyInstance(proxyID int64, newProxyStr string) error {
 	if !pm.isBlockAssets || pm.instances == nil {
-		return
+		return nil
 	}
-	pm.instances.StartInstance(proxyID, newProxyStr)
+	if _, err := pm.instances.StartInstance(proxyID, newProxyStr); err != nil {
+		fmt.Printf("[multiproxy] restart instance proxyID=%d failed: %v\n", proxyID, err)
+		return fmt.Errorf("start instance proxyID=%d: %w", proxyID, err)
+	}
+	return nil
 }
 
 // callChangeURL performs a GET request to the mobilehop webhook URL.

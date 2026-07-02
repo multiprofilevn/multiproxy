@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -240,4 +241,49 @@ func (pm *ProxyManager) HealthCheck() []ProxyStatus {
 		})
 	}
 	return statuses
+}
+
+// ProxyInspect is the full row snapshot returned by Inspect() — superset of
+// ProxyStatus, intended for debug/admin UIs. Contains raw proxy_str which may
+// embed credentials; do not log or expose externally.
+type ProxyInspect struct {
+	ID          int64
+	Type        ProxyType
+	ProxyStr    string
+	Running     bool
+	Used        int
+	Unique      bool
+	ThreadID    int
+	LastIP      string
+	Error       string
+	LastChanged time.Time
+	UpdatedAt   time.Time
+	CreatedAt   time.Time
+}
+
+// Inspect returns a snapshot of every proxy row in cache, sorted by ID.
+// Cache stays in lock-step with the DB via updateProxyFields/releaseProxy,
+// so this is the canonical view without paying for a SQL round-trip.
+func (pm *ProxyManager) Inspect() []ProxyInspect {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	out := make([]ProxyInspect, 0, len(pm.cache))
+	for _, p := range pm.cache {
+		out = append(out, ProxyInspect{
+			ID:          p.ID,
+			Type:        p.Type,
+			ProxyStr:    p.ProxyStr,
+			Running:     p.Running,
+			Used:        p.Used,
+			Unique:      p.Unique,
+			ThreadID:    p.ThreadID,
+			LastIP:      p.LastIP,
+			Error:       p.Error,
+			LastChanged: p.LastChanged,
+			UpdatedAt:   p.UpdatedAt,
+			CreatedAt:   p.CreatedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }

@@ -15,11 +15,22 @@ import (
 )
 
 // initDB opens the SQLite database with WAL mode and busy_timeout pragma.
+//
+// _txlock=immediate makes db.Begin() emit BEGIN IMMEDIATE, so the read-then-write
+// transaction in acquireAvailableProxy takes the write lock up front. Without it, a
+// deferred transaction that SELECTs then UPDATEs must upgrade to a writer mid-flight;
+// if another connection wrote to the WAL after the read snapshot, SQLite returns
+// SQLITE_BUSY immediately (deadlock avoidance) and busy_timeout is NOT honored.
+//
+// SetMaxOpenConns(1) serializes all access through a single connection, eliminating
+// writer-vs-writer contention entirely — safe here because writes are sub-millisecond
+// and throughput is bounded by the small proxy pool.
 func initDB(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+	db.SetMaxOpenConns(1)
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ping db: %w", err)

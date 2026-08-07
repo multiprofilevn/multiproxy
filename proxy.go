@@ -34,7 +34,7 @@ type Proxy struct {
 	ApiKey      string
 	ChangeUrl   string
 	MinTime     int // seconds between rotations
-	Running     bool
+	Running     int // number of handles currently held (0 = idle)
 	Used        int
 	Unique      bool
 	LastChanged time.Time
@@ -53,7 +53,16 @@ type Config struct {
 	ClearAllProxy       bool          // clear all proxies on init
 	MaxUsed             int           // max usage count before rotation
 	IsBlockAssets       bool          // route static assets directly
-	Limit               int           // duplicate each rotating proxyString into N independent slots (0/1 = no expansion). Ignored for static/sticky.
+	Limit               int           // concurrent handles allowed per unique proxy (0/1 = one at a time)
+}
+
+// effectiveSlots clamps Limit into a usable concurrency count. 0 (unset) and
+// negatives mean "one handle at a time", the behaviour before slots existed.
+func effectiveSlots(limit int) int {
+	if limit <= 1 {
+		return 1
+	}
+	return limit
 }
 
 // ProxyHandle is returned by Acquire(). Caller MUST call Release() when done.

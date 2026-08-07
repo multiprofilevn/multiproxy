@@ -65,8 +65,19 @@ type Config struct {
     ClearAllProxy       bool          // Clear all on init
     MaxUsed             int           // Max uses before rotation (0=unlimited)
     IsBlockAssets       bool          // Route assets directly (default: false)
+    Limit               int           // Concurrent handles per proxy (0/1 = one at a time)
 }
 ```
+
+### Limit — running several profiles on one proxy
+
+By default a unique proxy serves one `Acquire` at a time, so N threads need N
+proxies. `Limit: 3` lets three handles share each proxy, and they share its IP.
+
+Only the first holder rotates. Later holders join the address the first one
+settled on — rotating under their feet would change the IP mid-session for a
+peer that is already browsing. All holders still count against `MaxUsed`, so the
+per-IP usage budget is spent by the slots together rather than serially.
 
 ## API Reference
 

@@ -21,6 +21,7 @@ type ProxyManager struct {
 	providers           map[ProxyType]provider.Provider
 	changeProxyWaitTime time.Duration
 	maxUsed             int
+	slots               int // concurrent handles allowed per unique proxy (Config.Limit)
 	isBlockAssets       bool
 	ctx                 context.Context    // cancelled on Close()
 	cancel              context.CancelFunc // triggers ctx cancellation
@@ -47,6 +48,7 @@ func New(config Config) (*ProxyManager, error) {
 		providers:           initProviders(),
 		changeProxyWaitTime: config.ChangeProxyWaitTime,
 		maxUsed:             config.MaxUsed,
+		slots:               config.Limit,
 		isBlockAssets:       config.IsBlockAssets,
 		ctx:                 ctx,
 		cancel:              cancel,
@@ -82,7 +84,7 @@ func (pm *ProxyManager) Acquire(ctx context.Context, threadID int) (*ProxyHandle
 	defer cancel()
 
 	// 1. Atomically select + acquire proxy (no TOCTOU race)
-	p, err := pm.acquireAvailableProxy(pm.maxUsed, threadID)
+	p, first, err := pm.acquireAvailableProxy(pm.maxUsed, pm.slots, threadID)
 	if err != nil {
 		return nil, err
 	}
@@ -105,8 +107,17 @@ func (pm *ProxyManager) Acquire(ctx context.Context, threadID int) (*ProxyHandle
 		}, nil
 	}
 
-	// 3. Rotate if needed — release proxy on failure to prevent permanent lock
-	proxyStr, err := pm.rotateProxy(ctx, p)
+	// 3. Rotate if needed — release proxy on failure to prevent permanent lock.
+	// Only the first holder rotates. Under Limit > 1 the later slots join an IP
+	// a peer is already browsing on; rotating it here would yank the address out
+	// from under that peer mid-session. They share the address and still count
+	// against `used`, so the per-IP usage budget is spent by all slots together.
+	var proxyStr string
+	if first {
+		proxyStr, err = pm.rotateProxy(ctx, p)
+	} else {
+		proxyStr, err = pm.joinRotatedProxy(p)
+	}
 	if err != nil {
 		pm.releaseProxy(p.ID) // ensure cleanup on rotation failure
 		return nil, err
@@ -160,6 +171,7 @@ func (pm *ProxyManager) Reconfigure(config Config) error {
 	pm.mu.Lock()
 	pm.changeProxyWaitTime = config.ChangeProxyWaitTime
 	pm.maxUsed = config.MaxUsed
+	pm.slots = config.Limit
 	blockAssetsChanged := pm.isBlockAssets != config.IsBlockAssets
 	pm.isBlockAssets = config.IsBlockAssets
 	pm.mu.Unlock()
@@ -219,11 +231,12 @@ func mergeContexts(a, b context.Context) (context.Context, context.CancelFunc) {
 
 // ProxyStatus holds the current status of a proxy for health checking.
 type ProxyStatus struct {
-	ID      int64
-	Type    ProxyType
-	Running bool
-	Used    int
-	Error   string
+	ID           int64
+	Type         ProxyType
+	Running      bool // any handle outstanding
+	RunningCount int  // how many, under Limit > 1
+	Used         int
+	Error        string
 }
 
 // HealthCheck returns the status of all proxies.
@@ -233,11 +246,12 @@ func (pm *ProxyManager) HealthCheck() []ProxyStatus {
 	statuses := make([]ProxyStatus, 0, len(pm.cache))
 	for _, p := range pm.cache {
 		statuses = append(statuses, ProxyStatus{
-			ID:      p.ID,
-			Type:    p.Type,
-			Running: p.Running,
-			Used:    p.Used,
-			Error:   p.Error,
+			ID:           p.ID,
+			Type:         p.Type,
+			Running:      p.Running > 0,
+			RunningCount: p.Running,
+			Used:         p.Used,
+			Error:        p.Error,
 		})
 	}
 	return statuses
@@ -249,10 +263,11 @@ func (pm *ProxyManager) HealthCheck() []ProxyStatus {
 type ProxyInspect struct {
 	ID          int64
 	Type        ProxyType
-	ProxyStr    string
-	Running     bool
-	Used        int
-	Unique      bool
+	ProxyStr     string
+	Running      bool // any handle outstanding
+	RunningCount int  // how many, under Limit > 1
+	Used         int
+	Unique       bool
 	ThreadID    int
 	LastIP      string
 	Error       string
@@ -272,10 +287,11 @@ func (pm *ProxyManager) Inspect() []ProxyInspect {
 		out = append(out, ProxyInspect{
 			ID:          p.ID,
 			Type:        p.Type,
-			ProxyStr:    p.ProxyStr,
-			Running:     p.Running,
-			Used:        p.Used,
-			Unique:      p.Unique,
+			ProxyStr:     p.ProxyStr,
+			Running:      p.Running > 0,
+			RunningCount: p.Running,
+			Used:         p.Used,
+			Unique:       p.Unique,
 			ThreadID:    p.ThreadID,
 			LastIP:      p.LastIP,
 			Error:       p.Error,

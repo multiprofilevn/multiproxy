@@ -1,4 +1,4 @@
-package multiproxy
+﻿package multiproxy
 
 import (
 	"testing"
@@ -440,7 +440,7 @@ func TestReleaseProxy(t *testing.T) {
 	// Acquire
 	pm.db.Exec(`UPDATE proxies SET running=1 WHERE id=?`, id)
 	pm.mu.Lock()
-	pm.cache[id].Running = true
+	pm.cache[id].Running = 1
 	pm.mu.Unlock()
 
 	// Release
@@ -454,8 +454,86 @@ func TestReleaseProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getProxyByID error: %v", err)
 	}
-	if p.Running {
-		t.Errorf("proxy should not be running after release")
+	if p.Running != 0 {
+		t.Errorf("proxy should not be running after release, got %d", p.Running)
+	}
+}
+
+// TestReleaseProxy_FloorsAtZero guards the `running < slots` predicate: a double
+// Release() must not drive the counter negative, which would leave the proxy
+// permanently below the threshold and hand out unlimited slots.
+func TestReleaseProxy_FloorsAtZero(t *testing.T) {
+	pm := newTestManager(t)
+	defer pm.db.Close()
+
+	id, err := pm.upsertProxy(ProxyTypeStatic, "192.168.1.1:8080", "", "", 0, "test_key_floor", true, time.Now(), "")
+	if err != nil {
+		t.Fatalf("upsertProxy error: %v", err)
+	}
+
+	pm.releaseProxy(id) //nolint:errcheck
+	pm.releaseProxy(id) //nolint:errcheck
+
+	var running int
+	pm.db.QueryRow(`SELECT running FROM proxies WHERE id=?`, id).Scan(&running)
+	if running != 0 {
+		t.Errorf("running should floor at 0, got %d", running)
+	}
+}
+
+// TestAcquireAvailableProxy_SlotsAllowConcurrentHolders covers the Limit > 1
+// path: one proxy must serve N holders, and only the first one may rotate.
+func TestAcquireAvailableProxy_SlotsAllowConcurrentHolders(t *testing.T) {
+	pm := newTestManager(t)
+	defer pm.db.Close()
+
+	id, err := pm.upsertProxy(ProxyTypeStatic, "192.168.1.1:8080", "", "", 0, "test_key_slots", true, time.Now(), "")
+	if err != nil {
+		t.Fatalf("upsertProxy error: %v", err)
+	}
+
+	for i := 1; i <= 3; i++ {
+		p, first, err := pm.acquireAvailableProxy(0, 3, i)
+		if err != nil {
+			t.Fatalf("acquire #%d on a 3-slot proxy failed: %v", i, err)
+		}
+		if p.ID != id {
+			t.Errorf("acquire #%d: expected proxy %d, got %d", i, id, p.ID)
+		}
+		if want := i == 1; first != want {
+			t.Errorf("acquire #%d: first=%v, want %v", i, first, want)
+		}
+	}
+
+	// Fourth holder exceeds the slot count — the pool is now exhausted.
+	if _, _, err := pm.acquireAvailableProxy(0, 3, 4); err == nil {
+		t.Error("acquire #4 should fail once all 3 slots are taken")
+	}
+
+	// Releasing one slot makes exactly one more acquire possible.
+	pm.releaseProxy(id) //nolint:errcheck
+	if _, first, err := pm.acquireAvailableProxy(0, 3, 4); err != nil {
+		t.Errorf("acquire after release failed: %v", err)
+	} else if first {
+		t.Error("acquire after release should not be flagged as first holder")
+	}
+}
+
+// TestAcquireAvailableProxy_DefaultSlotsIsOne pins the pre-slots behaviour:
+// Limit unset (0) still means one holder at a time.
+func TestAcquireAvailableProxy_DefaultSlotsIsOne(t *testing.T) {
+	pm := newTestManager(t)
+	defer pm.db.Close()
+
+	if _, err := pm.upsertProxy(ProxyTypeStatic, "192.168.1.1:8080", "", "", 0, "test_key_slot1", true, time.Now(), ""); err != nil {
+		t.Fatalf("upsertProxy error: %v", err)
+	}
+
+	if _, first, err := pm.acquireAvailableProxy(0, 0, 1); err != nil || !first {
+		t.Fatalf("first acquire: err=%v first=%v", err, first)
+	}
+	if _, _, err := pm.acquireAvailableProxy(0, 0, 2); err == nil {
+		t.Error("second acquire should fail when Limit is unset")
 	}
 }
 
@@ -529,7 +607,7 @@ func TestQueryAvailableProxy_SelectsLowestUsed(t *testing.T) {
 	pm.db.Exec(`UPDATE proxies SET used=1 WHERE proxy_str='10.0.0.1:9090'`)
 
 	// Query should return second one (lowest used)
-	p, err := pm.queryAvailableProxy(10)
+	p, err := pm.queryAvailableProxy(10, 1)
 	if err != nil {
 		t.Fatalf("queryAvailableProxy error: %v", err)
 	}
@@ -552,7 +630,7 @@ func TestQueryAvailableProxy_IgnoresRunning(t *testing.T) {
 	pm.db.Exec(`UPDATE proxies SET running=1 WHERE id=?`, id1)
 
 	// Query should return second one (first is running and unique)
-	p, err := pm.queryAvailableProxy(10)
+	p, err := pm.queryAvailableProxy(10, 1)
 	if err != nil {
 		t.Fatalf("queryAvailableProxy error: %v", err)
 	}
@@ -572,7 +650,7 @@ func TestQueryAvailableProxy_RespectMaxUsed(t *testing.T) {
 	pm.db.Exec(`UPDATE proxies SET used=20, is_unique=1`)
 
 	// Query with maxUsed=10 should fail (used > maxUsed, running=false, unique=1)
-	_, err := pm.queryAvailableProxy(10)
+	_, err := pm.queryAvailableProxy(10, 1)
 	if err == nil {
 		t.Errorf("queryAvailableProxy should fail when used > maxUsed")
 	}
@@ -590,7 +668,7 @@ func TestQueryAvailableProxy_NonUniqueBypass(t *testing.T) {
 	pm.db.Exec(`UPDATE proxies SET running=1`)
 
 	// Query should still return it (non-unique bypasses running check)
-	p, err := pm.queryAvailableProxy(10)
+	p, err := pm.queryAvailableProxy(10, 1)
 	if err != nil {
 		t.Fatalf("queryAvailableProxy error: %v", err)
 	}
@@ -605,7 +683,7 @@ func TestQueryAvailableProxy_EmptyResultError(t *testing.T) {
 	defer pm.db.Close()
 
 	// No proxies inserted
-	_, err := pm.queryAvailableProxy(10)
+	_, err := pm.queryAvailableProxy(10, 1)
 	if err == nil {
 		t.Errorf("queryAvailableProxy should error with no available proxies")
 	}

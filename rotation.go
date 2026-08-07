@@ -18,36 +18,43 @@ func effectiveMaxUsed(maxUsed int) int {
 
 // acquireAvailableProxy atomically selects and acquires a proxy using a DB transaction.
 // This prevents TOCTOU race conditions where two goroutines select the same proxy.
-// Returns the acquired Proxy or an error if none available.
-func (pm *ProxyManager) acquireAvailableProxy(maxUsed int, threadID int) (*Proxy, error) {
+// Returns the acquired Proxy, whether the caller is the FIRST holder (running went
+// 0→1), and an error if none available. The first-holder flag decides who is allowed
+// to rotate the IP: a later slot must not swap the address out from under a peer
+// that is already browsing on it.
+func (pm *ProxyManager) acquireAvailableProxy(maxUsed, slots, threadID int) (*Proxy, bool, error) {
 	maxUsed = effectiveMaxUsed(maxUsed)
+	slots = effectiveSlots(slots)
 	nowUnix := time.Now().Unix()
 	now := time.Now()
 
 	tx, err := pm.db.Begin()
 	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
+		return nil, false, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// SELECT + UPDATE in single transaction — atomic acquire
+	// SELECT + UPDATE in single transaction — atomic acquire.
+	// `running < slots` replaces the old `running=0`: with slots=1 the predicate
+	// is identical, above 1 it lets N handles share one upstream. Ordering by
+	// running spreads load across the pool instead of stacking on the first row.
 	row := tx.QueryRow(`
 		SELECT id, type, proxy_str, api_key, change_url, min_time, running, used, is_unique,
 		       last_ip, last_changed, error, created_at, updated_at
 		FROM proxies
 		WHERE (
 			(is_unique = 0)
-			OR (type = 'static' AND running=0 AND used < ?)
-			OR (type = 'mobilehop' AND running=0)
-			OR (type = 'auto' AND running=0)
-			OR (type NOT IN ('static','mobilehop','auto') AND is_unique=1 AND running=0 AND (
+			OR (type = 'static' AND running < ? AND used < ?)
+			OR (type = 'mobilehop' AND running < ?)
+			OR (type = 'auto' AND running < ?)
+			OR (type NOT IN ('static','mobilehop','auto') AND is_unique=1 AND running < ? AND (
 				used < ?
 				OR (min_time = 0 OR (last_changed IS NULL OR (?-last_changed >= min_time)))
 			))
 		)
-		ORDER BY CASE WHEN is_unique=0 THEN 0 ELSE 1 END, used ASC, id ASC
+		ORDER BY CASE WHEN is_unique=0 THEN 0 ELSE 1 END, running ASC, used ASC, id ASC
 		LIMIT 1
-	`, maxUsed, maxUsed, nowUnix)
+	`, slots, maxUsed, slots, slots, slots, maxUsed, nowUnix)
 
 	var p Proxy
 	var apiKey, changeUrl, lastIP, errStr sql.NullString
@@ -58,9 +65,9 @@ func (pm *ProxyManager) acquireAvailableProxy(maxUsed int, threadID int) (*Proxy
 		&p.CreatedAt, &p.UpdatedAt,
 	); err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("no available proxy")
+			return nil, false, fmt.Errorf("no available proxy")
 		}
-		return nil, fmt.Errorf("scan proxy: %w", err)
+		return nil, false, fmt.Errorf("scan proxy: %w", err)
 	}
 	if apiKey.Valid {
 		p.ApiKey = apiKey.String
@@ -78,37 +85,41 @@ func (pm *ProxyManager) acquireAvailableProxy(maxUsed int, threadID int) (*Proxy
 		p.Error = errStr.String
 	}
 
-	// For unique proxies, atomically set running=1 within same transaction
+	// For unique proxies, atomically claim a slot within the same transaction.
+	// p.Running still holds the pre-increment value read above, so 0 identifies
+	// the first holder.
+	first := p.Running == 0
 	if p.Unique {
 		if _, err := tx.Exec(
-			`UPDATE proxies SET running=1, thread_id=?, updated_at=? WHERE id=?`,
+			`UPDATE proxies SET running=running+1, thread_id=?, updated_at=? WHERE id=?`,
 			threadID, now, p.ID,
 		); err != nil {
-			return nil, fmt.Errorf("acquire proxy in tx: %w", err)
+			return nil, false, fmt.Errorf("acquire proxy in tx: %w", err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit tx: %w", err)
+		return nil, false, fmt.Errorf("commit tx: %w", err)
 	}
 
 	// Sync cache after successful commit
 	if p.Unique {
 		pm.mu.Lock()
 		if cached, ok := pm.cache[p.ID]; ok {
-			cached.Running = true
+			cached.Running++
 			cached.UpdatedAt = now
 		}
 		pm.mu.Unlock()
 	}
 
-	return &p, nil
+	return &p, first, nil
 }
 
 // queryAvailableProxy selects a single candidate proxy from DB without holding any mutex.
 // Used internally by acquireAvailableProxy and useful for testing the selection query.
-func (pm *ProxyManager) queryAvailableProxy(maxUsed int) (*Proxy, error) {
+func (pm *ProxyManager) queryAvailableProxy(maxUsed, slots int) (*Proxy, error) {
 	maxUsed = effectiveMaxUsed(maxUsed)
+	slots = effectiveSlots(slots)
 	nowUnix := time.Now().Unix()
 	row := pm.db.QueryRow(`
 		SELECT id, type, proxy_str, api_key, change_url, min_time, running, used, is_unique,
@@ -116,17 +127,17 @@ func (pm *ProxyManager) queryAvailableProxy(maxUsed int) (*Proxy, error) {
 		FROM proxies
 		WHERE (
 			(is_unique = 0)
-			OR (type = 'static' AND running=0 AND used < ?)
-			OR (type = 'mobilehop' AND running=0)
-			OR (type = 'auto' AND running=0)
-			OR (type NOT IN ('static','mobilehop','auto') AND is_unique=1 AND running=0 AND (
+			OR (type = 'static' AND running < ? AND used < ?)
+			OR (type = 'mobilehop' AND running < ?)
+			OR (type = 'auto' AND running < ?)
+			OR (type NOT IN ('static','mobilehop','auto') AND is_unique=1 AND running < ? AND (
 				used < ?
 				OR (min_time = 0 OR (last_changed IS NULL OR (?-last_changed >= min_time)))
 			))
 		)
-		ORDER BY CASE WHEN is_unique=0 THEN 0 ELSE 1 END, used ASC, id ASC
+		ORDER BY CASE WHEN is_unique=0 THEN 0 ELSE 1 END, running ASC, used ASC, id ASC
 		LIMIT 1
-	`, maxUsed, maxUsed, nowUnix)
+	`, slots, maxUsed, slots, slots, slots, maxUsed, nowUnix)
 
 	var p Proxy
 	var apiKey, changeUrl, lastIP, errStr sql.NullString
@@ -157,6 +168,38 @@ func (pm *ProxyManager) queryAvailableProxy(maxUsed int) (*Proxy, error) {
 		p.Error = errStr.String
 	}
 	return &p, nil
+}
+
+// joinRotatedProxy resolves the upstream for a slot that is NOT the first holder
+// of a proxy (Limit > 1). It never contacts the provider: the address is whatever
+// the first holder settled on. `used` still advances so N parallel slots spend the
+// per-IP budget N times, keeping max_used an honest count of hits on one IP.
+//
+// The proxy is re-read from cache rather than trusting the transaction snapshot,
+// because the first holder may have written a fresh proxy_str between the two.
+func (pm *ProxyManager) joinRotatedProxy(p *Proxy) (string, error) {
+	proxyStr := p.ProxyStr
+	lastErr := p.Error
+	if cached, err := pm.getProxyByID(p.ID); err == nil {
+		proxyStr = cached.ProxyStr
+		lastErr = cached.Error
+	}
+
+	if proxyStr == "" {
+		if lastErr != "" {
+			return "", fmt.Errorf("no proxy_str available, last rotation error: %s", lastErr)
+		}
+		return "", fmt.Errorf("no proxy_str available for proxy %d", p.ID)
+	}
+
+	// Sticky strings are templates carrying a {random} session tag — leaving it
+	// unsubstituted would hand the caller a literal "{random}" as an upstream.
+	if p.Type == ProxyTypeSticky {
+		proxyStr = processStickyProxyStr(proxyStr)
+	}
+
+	pm.incrementUsed(p.ID, time.Now())
+	return proxyStr, nil
 }
 
 // rotateProxy applies type-specific rotation logic and returns the resolved proxy string.

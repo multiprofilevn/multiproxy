@@ -73,17 +73,30 @@ func (pm *ProxyManager) initSchema() error {
 	return nil
 }
 
-// releaseProxy sets running=false and clears thread_id for the given proxy ID.
-// Implements the stub declared in manager.go.
+// releaseProxy gives one slot back. running is a counter, so several handles
+// may be outstanding on the same proxy; thread_id is only meaningful while a
+// single holder remains, so it is cleared when the last one leaves. MAX(...,0)
+// guards against a double Release() driving the counter negative and wedging
+// the proxy below the `running < slots` predicate forever.
 func (pm *ProxyManager) releaseProxy(id int64) error {
 	now := time.Now()
-	if _, err := pm.db.Exec(`UPDATE proxies SET running=0, thread_id=NULL, updated_at=? WHERE id=?`, now, id); err != nil {
+	if _, err := pm.db.Exec(
+		`UPDATE proxies
+		 SET running=MAX(running-1, 0),
+		     thread_id=CASE WHEN MAX(running-1, 0)=0 THEN NULL ELSE thread_id END,
+		     updated_at=?
+		 WHERE id=?`, now, id); err != nil {
 		return fmt.Errorf("releaseProxy id=%d: %w", id, err)
 	}
 
 	pm.mu.Lock()
 	if p, ok := pm.cache[id]; ok {
-		p.Running = false
+		if p.Running > 0 {
+			p.Running--
+		}
+		if p.Running == 0 {
+			p.ThreadID = 0
+		}
 		p.UpdatedAt = now
 	}
 	pm.mu.Unlock()
@@ -98,7 +111,7 @@ func (pm *ProxyManager) resetAllProxies() {
 	pm.mu.Lock()
 	for _, p := range pm.cache {
 		p.Used = 0
-		p.Running = false
+		p.Running = 0
 		p.Error = ""
 		p.UpdatedAt = now
 	}
@@ -308,9 +321,13 @@ func applyFieldToProxy(p *Proxy, col string, val interface{}) {
 	case "running":
 		switch v := val.(type) {
 		case bool:
-			p.Running = v
+			if v {
+				p.Running = 1
+			} else {
+				p.Running = 0
+			}
 		case int:
-			p.Running = v != 0
+			p.Running = v
 		}
 	case "used":
 		if v, ok := val.(int); ok {

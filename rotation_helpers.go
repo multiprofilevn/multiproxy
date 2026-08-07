@@ -62,16 +62,10 @@ func (pm *ProxyManager) rotateViaProvider(ctx context.Context, p *Proxy, now tim
 // rotateMobileHop calls the change_url webhook for MobileHop proxies.
 func (pm *ProxyManager) rotateMobileHop(ctx context.Context, p *Proxy, now time.Time) (string, error) {
 	if err := pm.callChangeURL(ctx, p.ChangeUrl); err != nil {
-		errMsg := fmt.Sprintf("callChangeURL failed: %v", err)
-		// Release proxy (running=0, no error field set) — DB write outside lock
-		pm.db.Exec(`UPDATE proxies SET running=0, thread_id=NULL, updated_at=? WHERE id=?`, now, p.ID)
-		pm.mu.Lock()
-		if cached, ok := pm.cache[p.ID]; ok {
-			cached.Running = false
-			cached.UpdatedAt = now
-		}
-		pm.mu.Unlock()
-		return "", fmt.Errorf("%s", errMsg)
+		// Slot is handed back by Acquire, the only caller of rotateProxy — see
+		// the release-on-failure branch there. Releasing here too would
+		// decrement the counter twice and free a slot still held by a peer.
+		return "", fmt.Errorf("callChangeURL failed: %v", err)
 	}
 
 	// DB write outside lock
@@ -104,16 +98,9 @@ func (pm *ProxyManager) rotateIPv4Xoay(ctx context.Context, p *Proxy, now time.T
 		return "", fmt.Errorf("%s", errMsg)
 	}
 
-	// Blocked (status 101): release without setting error, caller should retry
+	// Blocked (status 101): no error recorded, caller should retry. Acquire
+	// hands the slot back on the error return.
 	if result.Blocked {
-		// DB write outside lock
-		pm.db.Exec(`UPDATE proxies SET running=0, thread_id=NULL, updated_at=? WHERE id=?`, now, p.ID)
-		pm.mu.Lock()
-		if cached, ok := pm.cache[p.ID]; ok {
-			cached.Running = false
-			cached.UpdatedAt = now
-		}
-		pm.mu.Unlock()
 		return "", fmt.Errorf("blocking status 101, retry later")
 	}
 
@@ -126,16 +113,15 @@ func (pm *ProxyManager) rotateIPv4Xoay(ctx context.Context, p *Proxy, now time.T
 	return newProxyStr, nil
 }
 
-// markError sets error, running=0, thread_id=NULL in DB then syncs cache.
+// markError records the failure. It no longer zeroes running: under Limit > 1
+// other handles may still be live on this proxy, and Acquire hands back the one
+// slot that failed.
 func (pm *ProxyManager) markError(id int64, errMsg string, now time.Time) {
 	// DB write outside lock
-	pm.db.Exec(`UPDATE proxies SET error=?, running=0, thread_id=NULL, updated_at=? WHERE id=?`,
-		errMsg, now, id)
+	pm.db.Exec(`UPDATE proxies SET error=?, updated_at=? WHERE id=?`, errMsg, now, id)
 	pm.mu.Lock()
 	if cached, ok := pm.cache[id]; ok {
 		cached.Error = errMsg
-		cached.Running = false
-		cached.ThreadID = 0
 		cached.UpdatedAt = now
 	}
 	pm.mu.Unlock()

@@ -271,6 +271,24 @@ func TestFormatProxyURL_HostPortUserPass(t *testing.T) {
 	}
 }
 
+// TestFormatProxyURL_TrailingEmptyCreds tests host:port:: (IPv4Xoay padding).
+func TestFormatProxyURL_TrailingEmptyCreds(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		// IPv4Xoay pads no-auth proxies with "::" — must not emit empty creds.
+		{"160.250.166.24:10262::", "http://160.250.166.24:10262"},
+		// A real username with empty password stays in the userinfo form.
+		{"160.250.166.24:10262:user:", "http://user:@160.250.166.24:10262"},
+	}
+	for _, tt := range tests {
+		if result := formatProxyURL(tt.input); result != tt.expected {
+			t.Errorf("formatProxyURL(%s) = %s, want %s", tt.input, result, tt.expected)
+		}
+	}
+}
+
 // TestFormatProxyURL_MalformedFallback tests fallback for malformed input.
 func TestFormatProxyURL_MalformedFallback(t *testing.T) {
 	input := "malformed:input:with:too:many:parts"

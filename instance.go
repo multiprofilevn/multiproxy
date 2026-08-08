@@ -180,11 +180,17 @@ func killPortRangeUnix() {
 // formatProxyURL converts a proxy string to http:// URL form.
 // "host:port"           → "http://host:port"
 // "host:port:user:pass" → "http://user:pass@host:port"
+// Trailing empty credential fields ("host:port::") are dropped — some upstream
+// APIs pad no-auth proxies that way, and keeping them would emit an empty
+// Proxy-Authorization header that auth-less proxies reject.
 func formatProxyURL(proxyStr string) string {
 	parts := strings.Split(proxyStr, ":")
+	if len(parts) == 4 && parts[2] == "" && parts[3] == "" {
+		parts = parts[:2]
+	}
 	switch len(parts) {
 	case 2:
-		return fmt.Sprintf("http://%s", proxyStr)
+		return fmt.Sprintf("http://%s:%s", parts[0], parts[1])
 	case 4:
 		return fmt.Sprintf("http://%s:%s@%s:%s", parts[2], parts[3], parts[0], parts[1])
 	default:

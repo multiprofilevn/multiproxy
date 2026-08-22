@@ -1,4 +1,4 @@
-module github.com/tuwibu/multiproxy
+module github.com/multiprofilevn/multiproxy
 
 go 1.25.5
 

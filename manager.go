@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tuwibu/multiproxy/provider"
+	"github.com/multiprofilevn/multiproxy/provider"
 )
 
 // ProxyManager is the main entry point for the multiproxy library.

@@ -11,7 +11,7 @@ package main
 
 import (
     "context"
-    "github.com/tuwibu/multiproxy"
+    "github.com/multiprofilevn/multiproxy"
 )
 
 func main() {
